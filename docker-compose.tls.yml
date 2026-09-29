@@ -1,0 +1,36 @@
+# Override TLS (KHÔNG dùng mặc định). Xem docs/security.md mục "TLS".
+#   bash scripts/gen_certs.sh
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+services:
+  minio-a:
+    command: server /data{1...4} --console-address ":9001" --certs-dir /certs
+    volumes:
+      - ./certs/minio-a:/certs:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local", "--insecure"]
+  minio-b:
+    command: server /data{1...4} --console-address ":9001" --certs-dir /certs
+    volumes:
+      - ./certs/minio-b:/certs:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local", "--insecure"]
+  mlflow-a:
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: https://minio-a:9000
+      AWS_CA_BUNDLE: /certs/ca.crt
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+  mlflow-b:
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: https://minio-b:9000
+      AWS_CA_BUNDLE: /certs/ca.crt
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+  mc:
+    volumes:
+      - ./certs/ca.crt:/root/.mc/certs/CAs/ca.crt:ro
+  backup-cron:
+    environment:
+      MC_HOST_siteA: https://${BACKUP_ACCESS_KEY}:${BACKUP_SECRET_KEY}@minio-a:9000
+    volumes:
+      - ./certs/ca.crt:/root/.mc/certs/CAs/ca.crt:ro

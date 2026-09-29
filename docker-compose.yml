@@ -1,0 +1,207 @@
+# Hạ tầng demo: lưu trữ, sao lưu & DR đa site cho hệ thống dự báo thời tiết.
+# Mọi bí mật lấy từ .env (tạo bằng `make env`).
+name: ltdl-dr
+
+x-minio: &minio
+  image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+  command: server /data{1...4} --console-address ":9001"
+  restart: unless-stopped
+  mem_limit: 1g
+  healthcheck:
+    test: ["CMD", "mc", "ready", "local"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+
+x-mlflow: &mlflow
+  build: ./docker/mlflow
+  image: ltdl-dr/mlflow:3.16.1
+  restart: unless-stopped
+  mem_limit: 1g
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+    interval: 10s
+    timeout: 5s
+    retries: 20
+    start_period: 20s
+
+x-postgres: &postgres
+  image: postgres:16.15-alpine
+  restart: unless-stopped
+  mem_limit: 512m
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+
+services:
+  # ============================ SITE A (chính) ============================
+  minio-a:
+    <<: *minio
+    hostname: minio-a
+    environment:
+      TZ: ${TZ}
+      MINIO_ROOT_USER: ${MINIO_A_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_A_ROOT_PASSWORD}
+      MINIO_SITE_NAME: site-a
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY}
+      MINIO_AUDIT_WEBHOOK_ENABLE_audit: "on"
+      MINIO_AUDIT_WEBHOOK_ENDPOINT_audit: http://audit-log:8080/site-a
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-a-data1:/data1
+      - minio-a-data2:/data2
+      - minio-a-data3:/data3
+      - minio-a-data4:/data4
+    networks: [site-a, replication]
+
+  postgres-a:
+    <<: *postgres
+    environment:
+      TZ: ${TZ}
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_A_PASSWORD}
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres-a-data:/var/lib/postgresql/data
+    networks: [site-a]
+
+  mlflow-a:
+    <<: *mlflow
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000 --workers 2
+      --backend-store-uri postgresql://mlflow:${POSTGRES_A_PASSWORD}@postgres-a:5432/mlflow
+      --default-artifact-root s3://mlflow-artifacts/
+      --no-serve-artifacts
+    environment:
+      TZ: ${TZ}
+      MLFLOW_S3_ENDPOINT_URL: http://minio-a:9000
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"   # tắt job runner GenAI (6 tiến trình huey, ~600MB RAM)
+      AWS_ACCESS_KEY_ID: ${MLFLOW_APP_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_APP_SECRET_KEY}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres-a: { condition: service_healthy }
+      minio-a: { condition: service_healthy }
+    networks: [site-a]
+
+  backup-cron:
+    build:
+      context: .
+      dockerfile: docker/backup-cron/Dockerfile
+    image: ltdl-dr/backup-cron:1.0
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      TZ: ${TZ}
+      BACKUP_SCHEDULE: "*/5 * * * *"
+      PGHOST: postgres-a
+      PGUSER: mlflow
+      PGDATABASE: mlflow
+      PGPASSWORD: ${POSTGRES_A_PASSWORD}
+      # Alias mc "siteA" bằng user backup riêng (không phải root)
+      MC_HOST_siteA: http://${BACKUP_ACCESS_KEY}:${BACKUP_SECRET_KEY}@minio-a:9000
+    volumes:
+      - ./scripts/backup_db.sh:/scripts/backup_db.sh:ro
+    depends_on:
+      postgres-a: { condition: service_healthy }
+      minio-a: { condition: service_healthy }
+    networks: [site-a]
+
+  # ============================ SITE B (DR) ============================
+  minio-b:
+    <<: *minio
+    hostname: minio-b
+    environment:
+      TZ: ${TZ}
+      MINIO_ROOT_USER: ${MINIO_B_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_B_ROOT_PASSWORD}
+      MINIO_SITE_NAME: site-b
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY}
+      MINIO_AUDIT_WEBHOOK_ENABLE_audit: "on"
+      MINIO_AUDIT_WEBHOOK_ENDPOINT_audit: http://audit-log:8080/site-b
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio-b-data1:/data1
+      - minio-b-data2:/data2
+      - minio-b-data3:/data3
+      - minio-b-data4:/data4
+    networks: [site-b, replication]
+
+  postgres-b:
+    <<: *postgres
+    profiles: [dr]
+    environment:
+      TZ: ${TZ}
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_B_PASSWORD}
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres-b-data:/var/lib/postgresql/data
+    networks: [site-b]
+
+  mlflow-b:
+    <<: *mlflow
+    profiles: [dr]
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000 --workers 2
+      --backend-store-uri postgresql://mlflow:${POSTGRES_B_PASSWORD}@postgres-b:5432/mlflow
+      --default-artifact-root s3://mlflow-artifacts/
+      --no-serve-artifacts
+    environment:
+      TZ: ${TZ}
+      MLFLOW_S3_ENDPOINT_URL: http://minio-b:9000
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"   # tắt job runner GenAI (6 tiến trình huey, ~600MB RAM)
+      AWS_ACCESS_KEY_ID: ${MLFLOW_APP_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_APP_SECRET_KEY}
+    ports:
+      - "5100:5000"
+    depends_on:
+      postgres-b: { condition: service_healthy }
+      minio-b: { condition: service_healthy }
+    networks: [site-b]
+
+  # ============================ Dùng chung ============================
+  # Nhận audit log (webhook) từ cả hai MinIO, ghi JSON Lines vào volume.
+  audit-log:
+    image: python:3.12.12-alpine3.22
+    restart: unless-stopped
+    mem_limit: 64m
+    command: ["python", "-u", "/app/receiver.py"]
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ./docker/audit-log/receiver.py:/app/receiver.py:ro
+      - audit-logs:/logs
+    networks: [site-a, site-b]
+
+  # mc chạy trong network replication, dùng cho `mc admin replicate add`
+  # (endpoint ngang hàng phải là tên nội bộ minio-a/minio-b, không phải localhost).
+  mc:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    profiles: [tools]
+    networks: [replication]
+
+networks:
+  site-a:
+  site-b:
+  replication:
+
+volumes:
+  minio-a-data1:
+  minio-a-data2:
+  minio-a-data3:
+  minio-a-data4:
+  minio-b-data1:
+  minio-b-data2:
+  minio-b-data3:
+  minio-b-data4:
+  postgres-a-data:
+  postgres-b-data:
+  audit-logs:

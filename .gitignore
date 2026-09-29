@@ -1,0 +1,6 @@
+certs/
+.env
+.venv/
+bin/
+__pycache__/
+mlruns/
